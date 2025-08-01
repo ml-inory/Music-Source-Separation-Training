@@ -339,6 +339,7 @@ class SCNet(nn.Module):
         x = torch.view_as_real(x)
         x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
                                           x.shape[1], x.shape[2])
+        print(f"x.shape: {x.shape}")
 
         B, C, Fr, T = x.shape
 
@@ -369,5 +370,55 @@ class SCNet(nn.Module):
         x = x.reshape(B, len(self.sources), self.audio_channels, -1)
 
         x = x[:, :, :, :-padding]
+
+        return x
+
+    def forward_for_export(self, x):
+        # # B, C, L = x.shape
+        # B = x.shape[0]
+        # # In the initial padding, ensure that the number of frames after the STFT (the length of the T dimension) is even,
+        # # so that the RFFT operation can be used in the separation network.
+        # padding = self.hop_length - x.shape[-1] % self.hop_length
+        # if (x.shape[-1] + padding) // self.hop_length % 2 == 0:
+        #     padding += self.hop_length
+        # x = F.pad(x, (0, padding))
+
+        # # STFT
+        # L = x.shape[-1]
+        # x = x.reshape(-1, L)
+        # x = torch.stft(x, **self.stft_config, return_complex=True)
+        # x = torch.view_as_real(x)
+        # x = x.permute(0, 3, 1, 2).reshape(x.shape[0] // self.audio_channels, x.shape[3] * self.audio_channels,
+        #                                   x.shape[1], x.shape[2])
+
+        B, C, Fr, T = x.shape
+
+        save_skip = deque()
+        save_lengths = deque()
+        save_original_lengths = deque()
+        # encoder
+        for sd_layer in self.encoder:
+            x, skip, lengths, original_lengths = sd_layer(x)
+            save_skip.append(skip)
+            save_lengths.append(lengths)
+            save_original_lengths.append(original_lengths)
+
+        # separation
+        x = self.separation_net(x)
+
+        # decoder
+        for fusion_layer, su_layer in self.decoder:
+            x = fusion_layer(x, save_skip.pop())
+            x = su_layer(x, save_lengths.pop(), save_original_lengths.pop())
+
+        # output
+        n = self.dims[0]
+        x = x.view(B, n, -1, Fr, T)
+        x = x.reshape(-1, 2, Fr, T).permute(0, 2, 3, 1)
+        # x = torch.view_as_complex(x.contiguous())
+        # x = torch.istft(x, **self.stft_config)
+        # x = x.reshape(B, len(self.sources), self.audio_channels, -1)
+
+        # x = x[:, :, :, :-padding]
 
         return x

@@ -115,6 +115,12 @@ class Attention(Module):
         x = self.norm(x)
 
         q, k, v = rearrange(self.to_qkv(x), 'b n (qkv h d) -> qkv b h n d', qkv=3, h=self.heads)
+        # b n (3 self.heads d)
+        # qkv = self.to_qkv(x)
+        # b, n, l = qkv.shape
+        # qkv = qkv.view(b, n, 3, self.heads, -1)
+        # qkv = qkv.permute(2, 0, 3, 1, 4)
+        # q, k, v = qkv
 
         if exists(self.rotary_embed):
             q = self.rotary_embed.rotate_queries_or_keys(q)
@@ -528,7 +534,9 @@ class BSRoformer(Module):
         stft_repr = unpack_one(stft_repr, batch_audio_channel_packed_shape, '* f t c')
 
         # merge stereo / mono into the frequency, with frequency leading dimension, for band splitting
+        print(f"stft_repr.shape: {stft_repr.shape}")
         stft_repr = rearrange(stft_repr,'b s f t c -> b (f s) t c')
+        print(f"stft_repr.shape: {stft_repr.shape}")
 
         x = rearrange(stft_repr, 'b f t c -> b t (f c)')
 
@@ -656,3 +664,118 @@ class BSRoformer(Module):
             return total_loss
 
         return total_loss, (loss, multi_stft_resolution_loss)
+    
+
+    def forward_for_export(self,
+                           stft_repr):
+        # x = rearrange(stft_repr, 'b f t c -> b t (f c)')
+        b, f, t, c = stft_repr.shape
+        x = stft_repr.transpose(2, 1).reshape(b, t, -1)
+
+        if self.use_torch_checkpoint:
+            x = checkpoint(self.band_split, x, use_reentrant=False)
+        else:
+            x = self.band_split(x)
+
+        # axial / hierarchical attention
+
+        store = [None] * len(self.layers)
+        for i, transformer_block in enumerate(self.layers):
+
+            if len(transformer_block) == 3:
+                linear_transformer, time_transformer, freq_transformer = transformer_block
+
+                # x, ft_ps = pack([x], 'b * d')
+                b = x.shape[0]
+                d = x.shape[-1]
+                x = x.view(b, -1, d)
+                other = x.shape[1:-1]
+
+                if self.use_torch_checkpoint:
+                    x = checkpoint(linear_transformer, x, use_reentrant=False)
+                else:
+                    x = linear_transformer(x)
+                # x, = unpack(x, ft_ps, 'b * d')
+                x = x.view(b, *other, d)
+            else:
+                time_transformer, freq_transformer = transformer_block
+
+            if self.skip_connection:
+                # Sum all previous
+                for j in range(i):
+                    x = x + store[j]
+
+            # x = rearrange(x, 'b t f d -> b f t d')
+            # x, ps = pack([x], '* t d')
+            x = x.transpose(2, 1)
+            b, f, t, d = x.shape
+            x = x.view(-1, t, d)
+
+            if self.use_torch_checkpoint:
+                x = checkpoint(time_transformer, x, use_reentrant=False)
+            else:
+                x = time_transformer(x)
+
+            # x, = unpack(x, ps, '* t d')
+            # x = rearrange(x, 'b f t d -> b t f d')
+            # x, ps = pack([x], '* f d')
+            x = x.view(b, f, t, d)
+            x = x.transpose(2, 1)
+            x = x.view(-1, f, d)
+
+            if self.use_torch_checkpoint:
+                x = checkpoint(freq_transformer, x, use_reentrant=False)
+            else:
+                x = freq_transformer(x)
+
+            # x, = unpack(x, ps, '* f d')
+            x = x.view(b, t, f, d)
+
+            if self.skip_connection:
+                store[i] = x
+
+        x = self.final_norm(x)
+
+        num_stems = len(self.mask_estimators)
+
+        if self.use_torch_checkpoint:
+            mask = torch.stack([checkpoint(fn, x, use_reentrant=False) for fn in self.mask_estimators], dim=1)
+        else:
+            mask = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
+        # mask = rearrange(mask, 'b n t (f c) -> b n f t c', c=2)
+        b, n, t, f_2 = mask.shape
+        mask = mask.view(b, n, t, f_2 // 2, 2)
+        mask = mask.transpose(3, 2)
+
+        # modulate frequency representation
+
+        # stft_repr = rearrange(stft_repr, 'b f t c -> b 1 f t c')
+        stft_repr = stft_repr.unsqueeze(1)
+
+        # complex number multiplication
+
+        # stft_repr = torch.view_as_complex(stft_repr)
+        # mask = torch.view_as_complex(mask)
+
+        # stft_repr = stft_repr * mask
+
+        # istft
+
+        # stft_repr = rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=self.audio_channels)
+
+        # # same as torch.stft() fix for MacOS MPS above
+        # try:
+        #     recon_audio = torch.istft(stft_repr, **self.stft_kwargs, window=stft_window, return_complex=False, length=raw_audio.shape[-1])
+        # except:
+        #     recon_audio = torch.istft(stft_repr.cpu() if x_is_mps else stft_repr, **self.stft_kwargs, window=stft_window.cpu() if x_is_mps else stft_window, return_complex=False, length=raw_audio.shape[-1]).to(device)
+
+        # recon_audio = rearrange(recon_audio, '(b n s) t -> b n s t', s=self.audio_channels, n=num_stems)
+
+        # if num_stems == 1:
+        #     recon_audio = rearrange(recon_audio, 'b 1 s t -> b s t')
+
+        # # if a target is passed in, calculate loss for learning
+
+        # if not exists(target):
+        #     return recon_audio
+        return mask, stft_repr
