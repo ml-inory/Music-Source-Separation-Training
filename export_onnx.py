@@ -82,9 +82,11 @@ def get_args():
     parser.add_argument("--onnx", type=str, required=True, help="Converted onnx model path")
 
     parser.add_argument("--model_type", "-t", type=str, default="bs_roformer", choices=["bs_roformer", "mel_band_roformer", "scnet"], help="Read README.md for reference")
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--chunk_size", type=int, default=44100*2)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--random_data", action="store_true")
-    parser.add_argument("--input_audio", type=str, default=None)
+    parser.add_argument("--input_audio", type=str, required=True)
     parser.add_argument("--calibration_dataset", type=str, default="./calibration_dataset")
     return parser.parse_args()
 
@@ -94,8 +96,12 @@ def load_model(args):
         config_file = "configs/config_bs_roformer_384_8_2_485100.yaml"
         ckpt_file = "results/model_bs_roformer_ep_17_sdr_9.6568.ckpt"
     elif args.model_type == "mel_band_roformer":
-        config_file = "configs/model_mel_band_roformer_experimental_ep_53_sdr_5.1235_config_mel_64_2_1_88200_experimental.yaml"
-        ckpt_file = "results/model_mel_band_roformer_experimental_ep_53_sdr_5.1235.ckpt"
+        if args.config is None or args.ckpt is None:
+            config_file = "configs/model_mel_band_roformer_experimental_ep_53_sdr_5.1235_config_mel_64_2_1_88200_experimental.yaml"
+            ckpt_file = "results/model_mel_band_roformer_experimental_ep_53_sdr_5.1235.ckpt"
+        else:
+            config_file = args.config
+            ckpt_file = args.ckpt
     elif args.model_type == "scnet":
         config_file = "configs/config_musdb18_scnet.yaml"
         ckpt_file = "results/scnet_checkpoint_musdb18.ckpt"
@@ -103,7 +109,7 @@ def load_model(args):
     model, config = get_model_from_config(args.model_type, config_file)
 
     state_dict = torch.load(ckpt_file, map_location=args.device, weights_only=True)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model = model.eval()
     return model, config
 
@@ -154,7 +160,7 @@ def main():
     model, config = load_model(args)
 
     instruments = config["training"]["instruments"]
-    chunk_size = config["audio"]["chunk_size"]
+    chunk_size = config["audio"]["chunk_size"] if args.chunk_size is None else args.chunk_size
     num_channels = config["audio"]["num_channels"]
     sample_rate = config["audio"]["sample_rate"]
     
@@ -165,187 +171,191 @@ def main():
     logger.info(f"chunk_size: {chunk_size}")
     logger.info(f"num_channels: {num_channels}")
     logger.info(f"sample_rate: {sample_rate}")
-    logger.info(f"random_data: {args.random_data}")
 
-    if args.random_data:
-        if args.model_type == "bs_roformer":
-            dim_freqs_in = config["model"]["dim_freqs_in"]
-            stft_hop_length = config["model"]["stft_hop_length"]
+    if args.model_type == "bs_roformer":
+        dim_freqs_in = config["model"]["dim_freqs_in"]
+        stft_hop_length = config["model"]["stft_hop_length"]
 
-            batch_size = 1
-            time_domain_shape = (batch_size, num_channels, chunk_size)
-            num_frames = int(math.ceil(chunk_size / stft_hop_length))
-            # b (f s) t c
-            freq_domain_shape = (batch_size, dim_freqs_in * num_channels, num_frames, 2)
+        batch_size = 1
+        time_domain_shape = (batch_size, num_channels, chunk_size)
+        num_frames = int(math.ceil(chunk_size / stft_hop_length))
+        # b (f s) t c
+        freq_domain_shape = (batch_size, dim_freqs_in * num_channels, num_frames, 2)
 
-            time_domain_input = torch.randn(time_domain_shape)
-            freq_domain_input = torch.randn(freq_domain_shape)
+        time_domain_input = torch.randn(time_domain_shape)
+        freq_domain_input = torch.randn(freq_domain_shape)
 
-            model.forward = model.forward_for_export
-            mask, stft_output = model(freq_domain_input)
-            # stft_output = model(freq_domain_input)
-            print(f"mask.shape: {mask.shape}")
-            print(f"stft_output.shape: {stft_output.shape}")
+        model.forward = model.forward_for_export
+        mask, stft_output = model(freq_domain_input)
+        # stft_output = model(freq_domain_input)
+        print(f"mask.shape: {mask.shape}")
+        print(f"stft_output.shape: {stft_output.shape}")
 
-            input_names = ["stft_input",]
-            output_names = ["mask", "stft_output",]
+        input_names = ["stft_input",]
+        output_names = ["mask", "stft_output",]
 
-            inputs = (
-                freq_domain_input,
+        inputs = (
+            freq_domain_input,
+        )
+
+        os.makedirs(args.calibration_dataset, exist_ok=True)
+        for i, name in enumerate(input_names):
+            with tf.open(os.path.join(args.calibration_dataset, name + ".tar.gz"), "w:gz") as f:
+                np.save(os.path.join(args.calibration_dataset, name + ".npy"), inputs[i].numpy())
+                f.add(os.path.join(args.calibration_dataset, name + ".npy"))
+    
+
+        onnx_dir = os.path.dirname(args.onnx)
+        if onnx_dir != '':
+            os.makedirs(onnx_dir, exist_ok=True)
+
+        logger.info("Exporting model to onnx...")
+        with torch.no_grad():
+            torch.onnx.export(model,               # model being run
+                inputs,                    # model input (or a tuple for multiple inputs)
+                args.onnx,              # where to save the model (can be a file or file-like object)
+                export_params=True,        # store the trained parameter weights inside the model file
+                opset_version=16,          # the ONNX version to export the model to
+                do_constant_folding=True,  # whether to execute constant folding for optimization
+                input_names=input_names, # the model's input names
+                output_names=output_names, # the model's output names
+                dynamic_axes=None,
+                optimize=True
             )
+            slim_model = onnxslim.slim(args.onnx)
+            onnx.save(slim_model, args.onnx)
+            logger.info(f"Successfully export onnx to {args.onnx}")
+    elif args.model_type == "mel_band_roformer":
+        assert os.path.exists(args.input_audio)
+        wav, origin_sr = sf.read(args.input_audio, always_2d=True, dtype="float32")
+        if origin_sr != sample_rate:
+            print(f"Origin sample rate is {origin_sr}, resampling to {sample_rate}...")
+            wav = librosa.resample(wav, orig_sr=origin_sr, target_sr=sample_rate)
+        if wav.shape[0] != 2:
+            wav = wav.transpose()
 
-            os.makedirs(args.calibration_dataset, exist_ok=True)
-            for i, name in enumerate(input_names):
-                with tf.open(os.path.join(args.calibration_dataset, name + ".tar.gz"), "w:gz") as f:
-                    np.save(os.path.join(args.calibration_dataset, name + ".npy"), inputs[i].numpy())
-                    f.add(os.path.join(args.calibration_dataset, name + ".npy"))
+        ref = wav.mean(0)
+        wav -= ref.mean()
+        wav /= ref.std() + 1e-8
+        mix = wav[np.newaxis, ...]
+
+        dim_freqs_in = config["model"]["dim_freqs_in"]
+        stft_hop_length = config["model"]["stft_hop_length"]
+        stft_n_fft = config["model"]["stft_n_fft"]
+        half_n_fft = stft_n_fft // 2
+
+        batch_size = 1
+        time_domain_shape = (batch_size, num_channels, chunk_size)
+        num_frames = int(math.ceil(chunk_size / stft_hop_length)) + 1
+        # b (f s) t c
         
+        # merge stereo / mono into the frequency, with frequency leading dimension, for band splitting
+        # stft_repr = rearrange(stft_repr,'b s f t c -> b (f s) t c')
+        freq_domain_shape = (batch_size, dim_freqs_in * num_channels, num_frames, 2)
 
-            onnx_dir = os.path.dirname(args.onnx)
-            if onnx_dir != '':
-                os.makedirs(onnx_dir, exist_ok=True)
+        offset = chunk_size * 30
+        time_domain_input = torch.from_numpy(mix[..., offset:offset + chunk_size])
+        # time_domain_input = torch.nn.functional.pad(time_domain_input, (half_n_fft, half_n_fft), mode='reflect')
+        # freq_domain_input = torch.randn(freq_domain_shape, device=args.device)
+        freq_domain_input = preprocess(time_domain_input)
 
-            logger.info("Exporting model to onnx...")
-            with torch.no_grad():
-                torch.onnx.export(model,               # model being run
-                    inputs,                    # model input (or a tuple for multiple inputs)
-                    args.onnx,              # where to save the model (can be a file or file-like object)
-                    export_params=True,        # store the trained parameter weights inside the model file
-                    opset_version=16,          # the ONNX version to export the model to
-                    do_constant_folding=True,  # whether to execute constant folding for optimization
-                    input_names=input_names, # the model's input names
-                    output_names=output_names, # the model's output names
-                    dynamic_axes=None,
-                    optimize=True
-                )
-                slim_model = onnxslim.slim(args.onnx)
-                onnx.save(slim_model, args.onnx)
-                logger.info(f"Successfully export onnx to {args.onnx}")
-        elif args.model_type == "mel_band_roformer":
-            assert os.path.exists(args.input_audio)
-            wav, origin_sr = sf.read(args.input_audio, always_2d=True, dtype="float32")
-            if origin_sr != sample_rate:
-                print(f"Origin sample rate is {origin_sr}, resampling to {sample_rate}...")
-                wav = librosa.resample(wav, orig_sr=origin_sr, target_sr=sample_rate)
-            if wav.shape[0] != 2:
-                wav = wav.transpose()
+        # batch_arange = torch.arange(batch_size, device=args.device)[..., None]
+        # freq_domain_input = freq_domain_input[batch_arange, model.freq_indices]
+        # print(f"freq_domain_input: {freq_domain_input.shape}")
 
-            ref = wav.mean(0)
-            wav -= ref.mean()
-            wav /= ref.std() + 1e-8
-            mix = wav[np.newaxis, ...]
+        # masks = model(time_domain_input)
 
-            dim_freqs_in = config["model"]["dim_freqs_in"]
-            stft_hop_length = config["model"]["stft_hop_length"]
+        model.forward = model.forward_for_export
+        masks = model(freq_domain_input)
+        
+        print(f"mask.shape: {masks.shape}")
 
-            batch_size = 1
-            time_domain_shape = (batch_size, num_channels, chunk_size)
-            num_frames = int(math.ceil(chunk_size / stft_hop_length)) + 1
-            # b (f s) t c
-            
-            # merge stereo / mono into the frequency, with frequency leading dimension, for band splitting
-            # stft_repr = rearrange(stft_repr,'b s f t c -> b (f s) t c')
-            freq_domain_shape = (batch_size, dim_freqs_in * num_channels, num_frames, 2)
+        input_names = ["stft_input",]
+        output_names = ["masks",]
 
-            time_domain_input = torch.randn(time_domain_shape)
-            # freq_domain_input = torch.randn(freq_domain_shape, device=args.device)
-            freq_domain_input = preprocess(mix[..., chunk_size*10:chunk_size*10 + chunk_size])
+        inputs = (
+            freq_domain_input,
+        )
 
-            # batch_arange = torch.arange(batch_size, device=args.device)[..., None]
-            # freq_domain_input = freq_domain_input[batch_arange, model.freq_indices]
-            print(f"freq_domain_input: {freq_domain_input.shape}")
+        os.makedirs(args.calibration_dataset, exist_ok=True)
+        for i, name in enumerate(input_names):
+            with tf.open(os.path.join(args.calibration_dataset, name + ".tar.gz"), "w:gz") as f:
+                np.save(os.path.join(args.calibration_dataset, name + ".npy"), inputs[i].numpy())
+                f.add(os.path.join(args.calibration_dataset, name + ".npy"))
+    
 
-            model.forward = model.forward_for_export
-            masks = model(freq_domain_input)
-            # masks = model(time_domain_input)
-            print(f"mask.shape: {masks.shape}")
+        onnx_dir = os.path.dirname(args.onnx)
+        if onnx_dir != '':
+            os.makedirs(onnx_dir, exist_ok=True)
 
-            input_names = ["stft_input",]
-            output_names = ["masks",]
-
-            inputs = (
-                freq_domain_input,
+        logger.info("Exporting model to onnx...")
+        with torch.no_grad():
+            torch.onnx.export(model,               # model being run
+                inputs,                    # model input (or a tuple for multiple inputs)
+                args.onnx,              # where to save the model (can be a file or file-like object)
+                export_params=True,        # store the trained parameter weights inside the model file
+                opset_version=16,          # the ONNX version to export the model to
+                do_constant_folding=True,  # whether to execute constant folding for optimization
+                input_names=input_names, # the model's input names
+                output_names=output_names, # the model's output names
+                dynamic_axes=None,
+                optimize=True
             )
+            slim_model = onnxslim.slim(args.onnx)
+            onnx.save(slim_model, args.onnx)
+            logger.info(f"Successfully export onnx to {args.onnx}")
+    elif args.model_type == "scnet":
+        nfft = config["model"]["nfft"]
+        hop_size = config["model"]["hop_size"]
 
-            os.makedirs(args.calibration_dataset, exist_ok=True)
-            for i, name in enumerate(input_names):
-                with tf.open(os.path.join(args.calibration_dataset, name + ".tar.gz"), "w:gz") as f:
-                    np.save(os.path.join(args.calibration_dataset, name + ".npy"), inputs[i].numpy())
-                    f.add(os.path.join(args.calibration_dataset, name + ".npy"))
-        
+        batch_size = 1
+        # time_domain_shape = (batch_size, num_channels, chunk_size)
+        num_frames = int(math.ceil(chunk_size / hop_size))
+        # b (f s) t c
+        freq_domain_shape = (batch_size, 2 * num_channels, nfft // 2 + 1, num_frames)
 
-            onnx_dir = os.path.dirname(args.onnx)
-            if onnx_dir != '':
-                os.makedirs(onnx_dir, exist_ok=True)
+        # time_domain_input = torch.randn(time_domain_shape)
+        freq_domain_input = torch.randn(freq_domain_shape)
 
-            logger.info("Exporting model to onnx...")
-            with torch.no_grad():
-                torch.onnx.export(model,               # model being run
-                    inputs,                    # model input (or a tuple for multiple inputs)
-                    args.onnx,              # where to save the model (can be a file or file-like object)
-                    export_params=True,        # store the trained parameter weights inside the model file
-                    opset_version=16,          # the ONNX version to export the model to
-                    do_constant_folding=True,  # whether to execute constant folding for optimization
-                    input_names=input_names, # the model's input names
-                    output_names=output_names, # the model's output names
-                    dynamic_axes=None,
-                    optimize=True
-                )
-                slim_model = onnxslim.slim(args.onnx)
-                onnx.save(slim_model, args.onnx)
-                logger.info(f"Successfully export onnx to {args.onnx}")
-        elif args.model_type == "scnet":
-            nfft = config["model"]["nfft"]
-            hop_size = config["model"]["hop_size"]
+        model.forward = model.forward_for_export
+        stft_output = model(freq_domain_input)
+        # stft_output = model(time_domain_input)
+        print(f"stft_output.shape: {stft_output.shape}")
 
-            batch_size = 1
-            # time_domain_shape = (batch_size, num_channels, chunk_size)
-            num_frames = int(math.ceil(chunk_size / hop_size))
-            # b (f s) t c
-            freq_domain_shape = (batch_size, 2 * num_channels, nfft // 2 + 1, num_frames)
+        input_names = ["stft_input",]
+        output_names = ["stft_output",]
 
-            # time_domain_input = torch.randn(time_domain_shape)
-            freq_domain_input = torch.randn(freq_domain_shape)
+        inputs = (
+            freq_domain_input,
+        )
 
-            model.forward = model.forward_for_export
-            stft_output = model(freq_domain_input)
-            # stft_output = model(time_domain_input)
-            print(f"stft_output.shape: {stft_output.shape}")
+        os.makedirs(args.calibration_dataset, exist_ok=True)
+        for i, name in enumerate(input_names):
+            with tf.open(os.path.join(args.calibration_dataset, name + ".tar.gz"), "w:gz") as f:
+                np.save(os.path.join(args.calibration_dataset, name + ".npy"), inputs[i].numpy())
+                f.add(os.path.join(args.calibration_dataset, name + ".npy"))
+    
 
-            input_names = ["stft_input",]
-            output_names = ["stft_output",]
+        onnx_dir = os.path.dirname(args.onnx)
+        if onnx_dir != '':
+            os.makedirs(onnx_dir, exist_ok=True)
 
-            inputs = (
-                freq_domain_input,
+        logger.info("Exporting model to onnx...")
+        with torch.no_grad():
+            torch.onnx.export(model,               # model being run
+                inputs,                    # model input (or a tuple for multiple inputs)
+                args.onnx,              # where to save the model (can be a file or file-like object)
+                export_params=True,        # store the trained parameter weights inside the model file
+                opset_version=16,          # the ONNX version to export the model to
+                do_constant_folding=True,  # whether to execute constant folding for optimization
+                input_names=input_names, # the model's input names
+                output_names=output_names, # the model's output names
+                dynamic_axes=None,
+                optimize=True
             )
-
-            os.makedirs(args.calibration_dataset, exist_ok=True)
-            for i, name in enumerate(input_names):
-                with tf.open(os.path.join(args.calibration_dataset, name + ".tar.gz"), "w:gz") as f:
-                    np.save(os.path.join(args.calibration_dataset, name + ".npy"), inputs[i].numpy())
-                    f.add(os.path.join(args.calibration_dataset, name + ".npy"))
-        
-
-            onnx_dir = os.path.dirname(args.onnx)
-            if onnx_dir != '':
-                os.makedirs(onnx_dir, exist_ok=True)
-
-            logger.info("Exporting model to onnx...")
-            with torch.no_grad():
-                torch.onnx.export(model,               # model being run
-                    inputs,                    # model input (or a tuple for multiple inputs)
-                    args.onnx,              # where to save the model (can be a file or file-like object)
-                    export_params=True,        # store the trained parameter weights inside the model file
-                    opset_version=16,          # the ONNX version to export the model to
-                    do_constant_folding=True,  # whether to execute constant folding for optimization
-                    input_names=input_names, # the model's input names
-                    output_names=output_names, # the model's output names
-                    dynamic_axes=None,
-                    optimize=True
-                )
-                slim_model = onnxslim.slim(args.onnx)
-                onnx.save(slim_model, args.onnx)
-                logger.info(f"Successfully export onnx to {args.onnx}")
+            slim_model = onnxslim.slim(args.onnx)
+            onnx.save(slim_model, args.onnx)
+            logger.info(f"Successfully export onnx to {args.onnx}")
     else:
         logger.error(f"Unknown model type: {args.model_type}")
 
