@@ -24,3 +24,11 @@ python export_onnx.py --onnx mel_band_roformer_depth4.onnx --model_type mel_band
 ```
 pulsar2 build --input mel_band_roformer_depth4.onnx --config mel_band_roformer.json --output_dir mel_band_roformer --output_name mel_band_roformer_depth4.axmodel
 ```
+
+## 板上运行
+
+```
+pip install -r requirements_ax.txt
+python test_axmodel.py -i Spring.wav --model mel_band_roformer_depth4.axmodel
+```
+在output文件夹生成分轨音频文件
