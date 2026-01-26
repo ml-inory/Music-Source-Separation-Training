@@ -19,6 +19,12 @@ python export_onnx.py --onnx mel_band_roformer_depth4.onnx --model_type mel_band
 
 运行完成后生成onnx和calibration_dataset
 
+## 测试ONNX
+
+```
+python test_axmodel.py -i Spring.wav --model mel_band_roformer_depth4.onnx
+```
+
 ## 导出axmodel
 
 ```
