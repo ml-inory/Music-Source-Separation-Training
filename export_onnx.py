@@ -25,13 +25,11 @@ import tarfile as tf
 
 warnings.filterwarnings("ignore")
 
-
-
 def setup_logging():
     """配置日志系统，同时输出到控制台和文件"""
     # 获取脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    log_file = os.path.join(script_dir, "train.log")
+    log_file = os.path.join(script_dir, "export_onnx.log")
     
     # 配置日志格式
     log_format = '%(asctime)s - %(levelname)s - %(message)s'
@@ -84,7 +82,7 @@ def get_args():
     parser.add_argument("--model_type", "-t", type=str, default="bs_roformer", choices=["bs_roformer", "mel_band_roformer", "scnet"], help="Read README.md for reference")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--chunk_size", type=int, default=44100*2)
+    parser.add_argument("--chunk_size", type=int, default=None, help="if None, use chunk_size if config")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--input_audio", type=str, required=True)
     parser.add_argument("--calibration_dataset", type=str, default="./calibration_dataset")
@@ -111,8 +109,8 @@ def load_model(args):
 
     state_dict = torch.load(ckpt_file, map_location=args.device, weights_only=True)
     model.load_state_dict(state_dict, strict=False)
-    if hasattr(model, "band_split"):
-        model.band_split.create_buffer()
+    # if hasattr(model, "band_split"):
+    #     model.band_split.create_buffer()
         
     model = model.eval()
     return model, config
@@ -196,6 +194,8 @@ def main():
     chunk_size = config["audio"]["chunk_size"] if args.chunk_size is None else args.chunk_size
     num_channels = config["audio"]["num_channels"]
     sample_rate = config["audio"]["sample_rate"]
+    hop_length = config["audio"]["hop_length"]
+    n_fft = config["audio"]["n_fft"]
     
     logger.info("-" * 70)
     logger.info(f"model_type: {args.model_type}")
@@ -204,10 +204,12 @@ def main():
     logger.info(f"chunk_size: {chunk_size}")
     logger.info(f"num_channels: {num_channels}")
     logger.info(f"sample_rate: {sample_rate}")
+    logger.info(f"hop_length: {hop_length}")
+    logger.info(f"n_fft: {n_fft}")
     logger.info(f"data_num: {args.data_num}")
     logger.info('-' * 70)
 
-    datas = generate_data(args.input_audio, config, chunk_size, offset=30, data_num=args.data_num)
+    datas = generate_data(args.input_audio, config, chunk_size, offset=0, data_num=args.data_num)
 
     if args.model_type == "bs_roformer":
         model.forward = model.forward_for_export
@@ -253,8 +255,6 @@ def main():
         model.forward = model.forward_for_export
         masks = model(datas[0])
         
-        print(f"mask.shape: {masks.shape}")
-
         input_names = ["stft_input",]
         output_names = ["masks",]
 

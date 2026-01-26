@@ -15,7 +15,7 @@ from torch.utils.checkpoint import checkpoint
 from beartype.typing import Tuple, Optional, List, Callable
 from beartype import beartype
 
-from rotary_embedding_torch import RotaryEmbedding
+from models.bs_roformer.rotary_embedding_torch import RotaryEmbedding
 
 from einops import rearrange, pack, unpack, reduce, repeat
 from einops.layers.torch import Rearrange
@@ -727,3 +727,88 @@ class MelBandRoformer(Module):
             return total_loss
 
         return total_loss, (loss, multi_stft_resolution_loss)
+
+    
+    def forward_for_export(
+            self,
+            stft_repr
+    ):
+        """
+        einops
+
+        b - batch
+        f - freq
+        t - time
+        s - audio channel (1 for mono, 2 for stereo)
+        n - number of 'stems'
+        c - complex (2)
+        d - feature dimension
+        """
+        batch_arange = torch.arange(1, device=stft_repr.device)[..., None]
+
+        # account for stereo
+
+        x = stft_repr[batch_arange, self.freq_indices]
+
+        # fold the complex (real and imag) into the frequencies dimension
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)
+        x = rearrange(x, 'b f t c -> b t (f c)')
+
+        if self.use_torch_checkpoint:
+            x = checkpoint(self.band_split, x, use_reentrant=False)
+        else:
+            x = self.band_split(x)
+
+        # axial / hierarchical attention
+
+        store = [None] * len(self.layers)
+        for i, transformer_block in enumerate(self.layers):
+
+            if len(transformer_block) == 3:
+                linear_transformer, time_transformer, freq_transformer = transformer_block
+
+                x, ft_ps = pack([x], 'b * d')
+                if self.use_torch_checkpoint:
+                    x = checkpoint(linear_transformer, x, use_reentrant=False)
+                else:
+                    x = linear_transformer(x)
+                x, = unpack(x, ft_ps, 'b * d')
+            else:
+                time_transformer, freq_transformer = transformer_block
+
+            if self.skip_connection:
+                # Sum all previous
+                for j in range(i):
+                    x = x + store[j]
+
+            x = rearrange(x, 'b t f d -> b f t d')
+            x, ps = pack([x], '* t d')
+
+            if self.use_torch_checkpoint:
+                x = checkpoint(time_transformer, x, use_reentrant=False)
+            else:
+                x = time_transformer(x)
+
+            x, = unpack(x, ps, '* t d')
+            x = rearrange(x, 'b f t d -> b t f d')
+            x, ps = pack([x], '* f d')
+
+            if self.use_torch_checkpoint:
+                x = checkpoint(freq_transformer, x, use_reentrant=False)
+            else:
+                x = freq_transformer(x)
+
+            x, = unpack(x, ps, '* f d')
+
+            if self.skip_connection:
+                store[i] = x
+
+        num_stems = len(self.mask_estimators)
+        if self.use_torch_checkpoint:
+            masks = torch.stack([checkpoint(fn, x, use_reentrant=False) for fn in self.mask_estimators], dim=1)
+        else:
+            masks = torch.stack([fn(x) for fn in self.mask_estimators], dim=1)
+        masks = rearrange(masks, 'b n t (f c) -> b n f t c', c=2)
+
+        return masks
